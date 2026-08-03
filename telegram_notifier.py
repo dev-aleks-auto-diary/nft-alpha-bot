@@ -1,5 +1,5 @@
 """
-Отправка алертов о новых коллекциях в Telegram.
+Отправка алертов о новых коллекциях в Telegram (v2).
 """
 
 import logging
@@ -7,52 +7,45 @@ import logging
 import httpx
 
 import config
-from alchemy_client import MintEvent
 
 logger = logging.getLogger(__name__)
 
 EXPLORERS = {
     "ethereum": "https://etherscan.io/address",
-    "base": "https://basescan.org/address",
-    "arbitrum": "https://arbiscan.io/address",
-}
-
-OPENSEA_CHAIN_SLUG = {
-    "ethereum": "ethereum",
-    "base": "base",
-    "arbitrum": "arbitrum",
 }
 
 
-def _explorer_url(event: MintEvent) -> str:
-    base = EXPLORERS.get(event.chain, "https://etherscan.io/address")
-    return f"{base}/{event.contract}"
+def _explorer_url(chain: str, contract: str) -> str:
+    base = EXPLORERS.get(chain, "https://etherscan.io/address")
+    return f"{base}/{contract}"
 
 
-def _opensea_url(event: MintEvent) -> str:
-    slug = OPENSEA_CHAIN_SLUG.get(event.chain, "ethereum")
-    return f"https://opensea.io/assets/{slug}/{event.contract}/{event.token_id}"
+def _opensea_url(chain: str, contract: str, token_id: int) -> str:
+    return f"https://opensea.io/assets/{chain}/{contract}/{token_id}"
 
 
-def _format_message(event: MintEvent) -> str:
+def _format_message(candidate: dict) -> str:
     lines = [
-        "🆕 <b>Похоже, новая коллекция</b>",
-        f"Сеть: {event.chain}",
-        f"Контракт: <code>{event.contract}</code>",
-        f"Первый токен: #{event.token_id}",
+        "🆕 <b>Новая коллекция прошла фильтры качества</b>",
+        f"Сеть: {candidate['chain']}",
+        f"Контракт: <code>{candidate['contract']}</code>",
         "",
-        f"🔗 <a href='{_explorer_url(event)}'>Explorer</a>",
-        f"🔗 <a href='{_opensea_url(event)}'>OpenSea</a>",
+        f"💰 Цена минта: {candidate.get('mint_price_eth', '—')} ETH",
+        f"👥 Уникальных минтеров за час: {candidate.get('unique_minters', '—')}",
+        f"✅ Контракт верифицирован: {'Да' if candidate.get('verified') else 'Нет/неизвестно'}",
+        "",
+        f"🔗 <a href='{_explorer_url(candidate['chain'], candidate['contract'])}'>Explorer</a>",
+        f"🔗 <a href='{_opensea_url(candidate['chain'], candidate['contract'], candidate['token_id'])}'>OpenSea</a>",
     ]
     return "\n".join(lines)
 
 
-async def send_alert(event: MintEvent) -> None:
+async def send_alert(candidate: dict) -> None:
     if "PUT_YOUR" in config.TELEGRAM_BOT_TOKEN:
         logger.warning("TELEGRAM_BOT_TOKEN не задан — алерт не отправлен")
         return
 
-    message = _format_message(event)
+    message = _format_message(candidate)
     url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": config.TELEGRAM_CHAT_ID,
@@ -66,4 +59,4 @@ async def send_alert(event: MintEvent) -> None:
         if resp.status_code != 200:
             logger.error("Ошибка отправки в Telegram: %s", resp.text)
         else:
-            logger.info("Алерт отправлен: %s (%s)", event.contract, event.chain)
+            logger.info("Алерт отправлен: %s (%s)", candidate["contract"], candidate["chain"])
