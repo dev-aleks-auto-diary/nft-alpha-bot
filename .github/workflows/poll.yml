@@ -2,7 +2,7 @@ name: NFT New Collections Check
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -28,11 +28,16 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           ALCHEMY_API_KEY: ${{ secrets.ALCHEMY_API_KEY }}
+          ETHERSCAN_API_KEY: ${{ secrets.ETHERSCAN_API_KEY }}
         run: python main.py
 
       - name: Save state back to repo
         run: |
           git config user.name "nft-bot"
+          git config user.email "nft-bot@users.noreply.github.com"
+          git add bot_state.json
+          git diff --quiet --cached || git commit -m "Update bot state"
+          git push
           git config user.email "nft-bot@users.noreply.github.com"
           git add bot_state.json
           git diff --quiet --cached || git commit -m "Update bot state"
