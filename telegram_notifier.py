@@ -12,6 +12,8 @@ logger = logging.getLogger(__name__)
 
 EXPLORERS = {
     "ethereum": "https://etherscan.io/address",
+    "apechain": "https://apescan.io/address",
+    "robinhood": "https://robinhoodchain.blockscout.com/address",
 }
 
 
@@ -24,19 +26,30 @@ def _opensea_url(chain: str, contract: str, token_id: int) -> str:
     return f"https://opensea.io/assets/{chain}/{contract}/{token_id}"
 
 
+MECHANIC_LABELS = {
+    "vault_lock": "🔒 Vault/lock — заморозка NFT навсегда",
+    "buyback": "💰 Buyback — выкуп командой",
+    "burn_to_mint": "🔥 Burn-to-mint",
+    "revenue_share": "📈 Revenue share",
+}
+
+
 def _format_message(candidate: dict) -> str:
-    lines = [
-        "🆕 <b>Новая коллекция прошла фильтры качества</b>",
+    mechanics = candidate.get("mechanics") or []
+
+    lines = ["🎯 <b>Обнаружена особая механика!</b>"]
+    for m in mechanics:
+        lines.append(MECHANIC_LABELS.get(m, m))
+    lines.append("")
+
+    lines += [
         f"Сеть: {candidate['chain']}",
         f"Контракт: <code>{candidate['contract']}</code>",
-        "",
-        f"💰 Цена минта: {candidate.get('mint_price_eth', '—')} ETH",
-        f"👥 Уникальных минтеров за час: {candidate.get('unique_minters', '—')}",
-        f"✅ Контракт верифицирован: {'Да' if candidate.get('verified') else 'Нет/неизвестно'}",
         "",
         f"🔗 <a href='{_explorer_url(candidate['chain'], candidate['contract'])}'>Explorer</a>",
         f"🔗 <a href='{_opensea_url(candidate['chain'], candidate['contract'], candidate['token_id'])}'>OpenSea</a>",
     ]
+
     return "\n".join(lines)
 
 

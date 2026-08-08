@@ -1,19 +1,22 @@
 """
 NFT New Collections Bot v2 — точка входа (одноразовый запуск, для GitHub Actions).
 
-Логика в два этапа:
+Упрощённая логика (по договорённости — только один способ обнаружения):
 
-1. ДЕТЕКТ КАНДИДАТОВ: как и раньше, ищем минты с tokenId 0/1 — но теперь
-   НЕ шлём алерт сразу, а кладём кандидата в очередь ожидания (state["pending"]).
+1. ДЕТЕКТ КАНДИДАТОВ: ищем минты с tokenId 0/1 (в том числе внутри пачки
+   ERC-1155) — это сигнал "похоже на самый первый минт новой коллекции".
+   Не шлём алерт сразу, а кладём кандидата в очередь ожидания.
 
-2. ОЦЕНКА НА ЧЕКПОИНТАХ: вместо одной проверки в фиксированный момент —
-   несколько контрольных точек с разным порогом (см. config.CHECKPOINTS).
-   Ранний чекпоинт (15 минут) с низким порогом ловит вирусные проекты,
-   которые распродаются за минуты. Более поздние чекпоинты (1ч, 6ч, 24ч)
-   с более высоким порогом дают шанс медленно набирающим обороты, но
-   реально качественным проектам. Кандидат проверяется на каждом
-   чекпоинте по очереди — прошёл хоть один, получает алерт и выходит из
-   очереди; не прошёл ни один вплоть до последнего — отбрасывается молча.
+2. ПРОВЕРКА НА МЕХАНИКИ: на каждом запуске смотрим исходник контракта
+   (через Etherscan, поддерживается только Ethereum) на ключевые слова
+   конкретных механик — vault/lock, buyback, burn-to-mint, revenue-share
+   (см. config.MECHANIC_KEYWORDS). Нашли — и GoPlus не считает контракт
+   рискованным — шлём алерт сразу. Не нашли (например, контракт ещё не
+   успели верифицировать) — ждём следующего запуска и проверяем заново,
+   пока не пройдёт config.MAX_CANDIDATE_AGE_SECONDS — тогда молча отбрасываем.
+
+Никакой оценки по числу минтеров/популярности больше нет — единственный
+критерий "это интересно" — конкретная механика в коде контракта.
 
 Запуск:
     pip install -r requirements.txt
@@ -28,8 +31,9 @@ import time
 from pathlib import Path
 
 import config
-from alchemy_client import count_unique_minters, fetch_mints_since, get_latest_block, get_tx_value_eth
-from etherscan_client import is_contract_verified
+from alchemy_client import fetch_mints_since, get_latest_block
+from etherscan_client import find_mechanic_keywords
+from goplus_client import check_nft_security
 from telegram_notifier import send_alert
 
 logging.basicConfig(
@@ -60,7 +64,7 @@ async def init_chain_state(chain: str, base_url: str, state: dict) -> None:
         logger.info("Сеть %s: начинаем отслеживание с блока %d", chain, latest)
         return
 
-    # Совместимость со старым state-файлом (до добавления фильтров качества)
+    # Совместимость со старым state-файлом
     state[chain].setdefault("pending", {})
     state[chain].setdefault("seen_tx", [])
 
@@ -88,17 +92,14 @@ async def collect_candidates(chain: str, base_url: str, state: dict) -> None:
     chain_state["seen_tx"] = list(seen_tx)[-5000:]
 
 
-async def evaluate_pending(chain: str, base_url: str, state: dict) -> None:
+async def evaluate_pending(chain: str, state: dict) -> None:
     """
-    Этап 2: проверяем кандидатов на чекпоинтах.
+    Этап 2: проверяем кандидатов на ключевые слова механик.
 
-    Для каждого кандидата храним checkpoint_index — на каком чекпоинте
-    он сейчас "стоит в очереди". Если прошло достаточно времени с
-    первого минта — оцениваем на этом чекпоинте. Прошёл фильтры —
-    алерт и удаляем из очереди. Не прошёл — если это был последний
-    чекпоинт, отбрасываем совсем; иначе просто ждём следующего чекпоинта
-    (индекс не увеличиваем сами — он выберется естественно по времени
-    при следующем вызове, когда шаг проверки дойдёт до него).
+    Проверка контракта возможна только там, где Etherscan знает исходник
+    (config.MECHANIC_CHECK_CHAINS) — для остальных сетей кандидат просто
+    ждёт истечения MAX_CANDIDATE_AGE_SECONDS и тихо отбрасывается, так как
+    альтернативного способа оценки в этой версии нет.
     """
     chain_state = state[chain]
     pending = chain_state.get("pending", {})
@@ -106,74 +107,39 @@ async def evaluate_pending(chain: str, base_url: str, state: dict) -> None:
         return
 
     now = time.time()
-    latest_block = await get_latest_block(base_url)
     still_pending = {}
+    can_check_mechanics = chain in config.MECHANIC_CHECK_CHAINS
 
     for contract, info in pending.items():
         age_seconds = now - info["first_seen_time"]
 
-        # Находим самый поздний чекпоинт, время которого уже наступило
-        checkpoint_idx = None
-        for idx, (delay, _min_minters) in enumerate(config.CHECKPOINTS):
-            if age_seconds >= delay:
-                checkpoint_idx = idx
+        mechanics_found = []
+        if can_check_mechanics:
+            mechanics_found = await find_mechanic_keywords(contract)
 
-        already_checked = info.get("last_checkpoint_checked", -1)
-        if checkpoint_idx is None or checkpoint_idx <= already_checked:
-            still_pending[contract] = info  # рано, либо этот чекпоинт уже проверяли
-            continue
+        if mechanics_found:
+            goplus_risks = await check_nft_security(chain, contract)
+            if goplus_risks:
+                logger.info(
+                    "⚠️ %s: механика %s найдена, но GoPlus нашёл риски — не шлём: %s",
+                    contract, mechanics_found, "; ".join(goplus_risks.values()),
+                )
+            else:
+                logger.info("🎯 %s: обнаружена механика %s — отправляю алерт", contract, mechanics_found)
+                await send_alert(
+                    {
+                        "chain": chain,
+                        "contract": contract,
+                        "token_id": info["token_id"],
+                        "mechanics": mechanics_found,
+                    }
+                )
+                continue  # прошёл — из очереди убираем
 
-        delay, min_minters_required = config.CHECKPOINTS[checkpoint_idx]
-        logger.info(
-            "Оцениваю кандидата %s (%s) на чекпоинте #%d (%d минут)",
-            contract, chain, checkpoint_idx, delay // 60,
-        )
-
-        mint_price = await get_tx_value_eth(base_url, info["tx_hash"])
-        minters = await count_unique_minters(base_url, contract, info["first_seen_block"], latest_block)
-        verified = await is_contract_verified(contract)
-
-        passed = True
-        reasons_failed = []
-
-        if config.MIN_MINT_PRICE_ETH > 0:
-            if mint_price is None or mint_price < config.MIN_MINT_PRICE_ETH:
-                passed = False
-                reasons_failed.append(f"цена минта {mint_price} < {config.MIN_MINT_PRICE_ETH}")
-
-        if minters < min_minters_required:
-            passed = False
-            reasons_failed.append(f"минтеров {minters} < {min_minters_required} (чекпоинт #{checkpoint_idx})")
-
-        if config.REQUIRE_VERIFIED_CONTRACT and verified is False:
-            passed = False
-            reasons_failed.append("контракт не верифицирован")
-
-        if passed:
-            logger.info("✅ %s прошёл чекпоинт #%d — отправляю алерт", contract, checkpoint_idx)
-            await send_alert(
-                {
-                    "chain": chain,
-                    "contract": contract,
-                    "token_id": info["token_id"],
-                    "mint_price_eth": mint_price,
-                    "unique_minters": minters,
-                    "verified": verified,
-                }
-            )
-            # прошёл — больше не наблюдаем, убираем из очереди
-            continue
-
-        is_last_checkpoint = checkpoint_idx == len(config.CHECKPOINTS) - 1
-        if is_last_checkpoint:
-            logger.info("❌ %s отсеян окончательно (последний чекпоинт): %s", contract, "; ".join(reasons_failed))
-            # не проваливаем: не добавляем обратно в still_pending — кандидат отброшен
+        if age_seconds >= config.MAX_CANDIDATE_AGE_SECONDS:
+            logger.info("❌ %s отсеян окончательно (истёк максимальный возраст, механик не найдено)", contract)
+            # не добавляем обратно в still_pending — кандидат отброшен
         else:
-            logger.info(
-                "⏳ %s не прошёл чекпоинт #%d (%s), ждём следующий",
-                contract, checkpoint_idx, "; ".join(reasons_failed),
-            )
-            info["last_checkpoint_checked"] = checkpoint_idx
             still_pending[contract] = info
 
     chain_state["pending"] = still_pending
@@ -188,7 +154,7 @@ async def run_once() -> None:
         try:
             await init_chain_state(chain, base_url, state)
             await collect_candidates(chain, base_url, state)
-            await evaluate_pending(chain, base_url, state)
+            await evaluate_pending(chain, state)
         except Exception as e:
             logger.exception("Ошибка при обработке сети %s: %s", chain, e)
 

@@ -66,7 +66,7 @@ async def fetch_mints_since(chain: str, base_url: str, from_block: int) -> tuple
                 "toBlock": "latest",
                 "category": ["erc721", "erc1155"],
                 "fromAddress": ZERO_ADDRESS,
-                "withMetadata": False,
+                "withMetadata": True,
                 "excludeZeroValue": False,
                 "order": "asc",
                 "maxCount": hex(config.MAX_TRANSFERS_PER_POLL),
@@ -96,10 +96,21 @@ async def fetch_mints_since(chain: str, base_url: str, from_block: int) -> tuple
         if block_num is not None:
             max_block = block_num if max_block is None else max(max_block, block_num)
 
-        token_id_hex = t.get("erc721TokenId") or t.get("tokenId")
+        token_id_hex = t.get("erc721TokenId")
         token_id = _hex_to_int(token_id_hex)
+
         if token_id is None:
-            continue
+            # ERC-1155 может минтить пачкой — тогда одиночного tokenId нет,
+            # а есть список erc1155Metadata с несколькими tokenId сразу.
+            # Берём минимальный tokenId из пачки: если среди заминченных
+            # в этой транзакции токенов есть genesis-номер — считаем это
+            # тем же сигналом "похоже на самый первый минт коллекции".
+            batch = t.get("erc1155Metadata") or []
+            batch_ids = [_hex_to_int(item.get("tokenId")) for item in batch]
+            batch_ids = [b for b in batch_ids if b is not None]
+            if not batch_ids:
+                continue
+            token_id = min(batch_ids)
 
         if token_id > config.GENESIS_TOKEN_ID_MAX:
             continue
